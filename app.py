@@ -26,139 +26,202 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("models/gemini-2.5-flash")
 
 # -----------------------------
-# Semantic Scholar API functions
+# OpenAlex API functions
 # -----------------------------
-def search_semantic_scholar(query: str, limit: int = 20, year_filter: str = None, min_citations: int = None):
+def search_openalex(query: str, limit: int = 20, year_filter: str = None, min_citations: int = None):
     """
-    Search Semantic Scholar API for papers using the official endpoint
-    Documentation: https://api.semanticscholar.org/api-docs/graph#tag/Paper-Data/operation/get_graph_paper_relevance_search
+    Search OpenAlex API for papers using the works endpoint
+    Documentation: https://docs.openalex.org/api-entities/works/search-works
+    OpenAlex has generous rate limits (10 requests/second) - no rate limit handling needed
     """
     query = query.strip()
     if not query:
         return []
     
-    # Clean query - remove redundant words
+    # Clean query - remove redundant words (but keep the query meaningful)
     query = query.replace(" papers", "").replace(" paper", "")
     query = query.replace(" articles", "").replace(" article", "")
     query = query.strip()
     
-    # Ensure limit is within valid range (max 100 per API docs)
-    limit = max(1, min(limit, 100))
+    # Ensure query is still valid after cleaning
+    if not query or len(query) < 2:
+        st.warning("⚠️ Search query is too short. Please enter at least 2 characters.")
+        return []
     
-    # Use the correct endpoint from documentation
-    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+    # Ensure limit is within valid range (max 200 per API docs, but we'll use 25 for performance)
+    limit = max(1, min(limit, 25))
     
-    # Build parameters according to API documentation
+    # Use the OpenAlex works endpoint
+    url = "https://api.openalex.org/works"
+    
+    # Build parameters according to OpenAlex API documentation
+    # OpenAlex uses 'search' parameter for full-text search
     params = {
-        "query": query,
-        "limit": limit,
-        "fields": "title,authors,year,abstract,venue,citationCount,url,externalIds,fieldsOfStudy,publicationTypes"
+        "search": query,
+        "per_page": limit
     }
     
+    # Note: OpenAlex doesn't support 'select' parameter in the same way
+    # We'll get all fields and extract what we need
+    
     # Add optional filters
+    filters = []
+    
     if year_filter:
-        params["year"] = year_filter  # Format: "2016-2020" or "2019"
+        # Parse year filter (format: "2016-2020" or "2019")
+        if "-" in year_filter:
+            years = year_filter.split("-")
+            try:
+                start_year = int(years[0])
+                end_year = int(years[1])
+                filters.append(f"publication_year:{start_year}-{end_year}")
+            except:
+                pass
+        else:
+            try:
+                year = int(year_filter)
+                filters.append(f"publication_year:{year}")
+            except:
+                pass
     
     if min_citations:
-        params["minCitationCount"] = str(min_citations)
+        filters.append(f"cited_by_count:>={min_citations}")
+    
+    # Combine filters with comma separation
+    if filters:
+        params["filter"] = ",".join(filters)
     
     try:
-        response = requests.get(url, params=params, timeout=10)
+        # Make request with proper headers
+        headers = {
+            'User-Agent': 'LiteratureReviewApp/1.0 (mailto:user@example.com)'  # OpenAlex prefers identifying user agents
+        }
+        
+        # Debug: Log the request URL (remove in production)
+        # st.write(f"Debug: Requesting {url} with params: {params}")
+        
+        response = requests.get(url, params=params, headers=headers, timeout=15)
         
         if response.status_code == 200:
             data = response.json()
             
-            # API returns: total, offset, next, data[]
-            papers_data = data.get('data', [])
-            total_results = data.get('total', 0)
+            # OpenAlex returns: meta, results[]
+            papers_data = data.get('results', [])
+            
+            # If no results, return empty list
+            if not papers_data:
+                return []
             
             papers = []
-            for idx, paper in enumerate(papers_data, 1):
-                # Extract authors - API returns array with name field
+            for paper in papers_data:
+                # Extract title
+                title = paper.get('display_name') or paper.get('title', 'Untitled')
+                
+                # Extract authors from authorships array
                 authors = []
-                if paper.get('authors'):
-                    authors = [author.get('name', '') for author in paper.get('authors', []) if author.get('name')]
+                if paper.get('authorships'):
+                    for authorship in paper.get('authorships', []):
+                        author = authorship.get('author')
+                        if author:
+                            author_name = author.get('display_name', '')
+                            if author_name:
+                                authors.append(author_name)
                 
-                # Extract DOI from externalIds
-                doi = ""
-                if paper.get('externalIds') and isinstance(paper.get('externalIds'), dict):
-                    doi = paper.get('externalIds', {}).get('DOI', '')
+                # Extract year
+                year = paper.get('publication_year') or 0
                 
-                # Extract fields of study
-                fields_of_study = paper.get('fieldsOfStudy', [])
+                # Extract abstract
+                abstract = paper.get('abstract', 'No abstract available')
+                # OpenAlex abstracts are sometimes in inverted format, check if it starts with inverted
+                if abstract.startswith("InvertedAbstract"):
+                    # Try to extract the actual abstract
+                    abstract = abstract.replace("InvertedAbstract", "").strip()
                 
-                # Use paperId from Semantic Scholar as primary ID, or create unique hash
-                unique_id = paper.get('paperId') or hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                # Extract journal/venue from primary_location
+                journal = "N/A"
+                if paper.get('primary_location'):
+                    source = paper.get('primary_location', {}).get('source')
+                    if source:
+                        journal = source.get('display_name', 'N/A')
+                
+                # Extract DOI
+                doi = paper.get('doi', '').replace('https://doi.org/', '') if paper.get('doi') else ''
+                
+                # Extract concepts (similar to fields of study)
+                concepts = []
+                if paper.get('concepts'):
+                    concepts = [concept.get('display_name', '') for concept in paper.get('concepts', [])[:5] if concept.get('display_name')]
+                
+                # Extract citation count
+                citation_count = paper.get('cited_by_count', 0)
+                
+                # Extract OpenAlex ID (URL format: https://openalex.org/W123456789)
+                openalex_id = paper.get('id', '').replace('https://openalex.org/', '') if paper.get('id') else ''
+                
+                # Extract URL
+                url_link = paper.get('primary_location', {}).get('landing_page_url', '') or paper.get('id', '')
+                
+                # Use OpenAlex ID as primary identifier, or create unique hash
+                unique_id = openalex_id or hash(f"{title}_{year}")
                 
                 paper_obj = {
-                    "id": unique_id,  # Use unique ID instead of sequential idx
-                    "paperId": paper.get('paperId', ''),
-                    "title": paper.get('title', 'Untitled'),
+                    "id": unique_id,
+                    "paperId": openalex_id,  # Store OpenAlex ID
+                    "title": title,
                     "authors": authors if authors else ["Unknown"],
-                    "year": paper.get('year') or 0,
-                    "abstract": paper.get('abstract', 'No abstract available'),
-                    "journal": paper.get('venue', 'N/A'),
+                    "year": year,
+                    "abstract": abstract if abstract else "No abstract available",
+                    "journal": journal,
                     "doi": doi,
-                    "keywords": fields_of_study,  # Use fields of study as keywords
-                    "citation_count": paper.get('citationCount', 0),
-                    "url": paper.get('url', ''),
-                    "fieldsOfStudy": fields_of_study,
-                    "publicationTypes": paper.get('publicationTypes', [])
+                    "keywords": concepts,  # Use concepts as keywords
+                    "citation_count": citation_count,
+                    "url": url_link,
+                    "fieldsOfStudy": concepts,
+                    "publicationTypes": []
                 }
                 papers.append(paper_obj)
             
             return papers
         
         elif response.status_code == 429:
-            # Get retry-after header (in seconds), default to 5 minutes if not provided
-            retry_after_header = response.headers.get('Retry-After')
-            if retry_after_header:
-                try:
-                    retry_after = int(retry_after_header)
-                except:
-                    retry_after = 300  # Default to 5 minutes
-            else:
-                # If no Retry-After header, use a conservative 5 minutes
-                retry_after = 300
-            
-            # Only update rate limit time if we don't already have one set (don't reset timer)
-            if not st.session_state.rate_limit_time:
-                # Set rate limit expiration time
-                st.session_state.rate_limit_time = datetime.datetime.now() + datetime.timedelta(seconds=retry_after)
-            
-            # Calculate remaining time
-            if st.session_state.rate_limit_time:
-                time_remaining = (st.session_state.rate_limit_time - datetime.datetime.now()).total_seconds()
-                if time_remaining > 0:
-                    minutes = int(time_remaining // 60)
-                    seconds = int(time_remaining % 60)
-                else:
-                    minutes = retry_after // 60
-                    seconds = retry_after % 60
-            else:
-                minutes = retry_after // 60
-                seconds = retry_after % 60
-            
-            st.error(f"""
-            ❌ **Rate Limit Exceeded (429)**
-            
-            Semantic Scholar API rate limit reached. Please wait **{minutes} minutes {seconds} seconds** before trying again.
-            
-            **Tip:** 
-            - Use cached results from previous searches (shown below)
-            - Switch to "Local Papers" mode for instant access
-            - The timer will automatically clear when the rate limit expires
-            """)
+            # OpenAlex rate limit (very rare, but handle it)
+            st.warning("⏰ OpenAlex rate limit reached. Please wait a moment and try again.")
             return []
         
         elif response.status_code == 400:
-            st.error("❌ Invalid search query. Try a different search term.")
+            # Try to get more details from the error response
+            try:
+                error_data = response.json()
+                error_msg = error_data.get('message', 'Invalid search query')
+                st.error(f"❌ OpenAlex API error: {error_msg}")
+                st.info(f"💡 **Troubleshooting:**\n- Make sure your search query is not empty\n- Try simpler search terms\n- Check if special characters are causing issues")
+            except:
+                # If we can't parse JSON, show the raw response text
+                try:
+                    error_text = response.text[:200]  # First 200 chars
+                    st.error(f"❌ Invalid search query. API response: {error_text}")
+                except:
+                    st.error("❌ Invalid search query. Try a different search term.")
+            return []
+        
+        elif response.status_code == 429:
+            # OpenAlex rate limit (very rare, but handle it)
+            st.warning("⏰ OpenAlex rate limit reached. Please wait a moment and try again.")
             return []
         
         else:
-            st.error(f"❌ API error: {response.status_code}")
+            # Try to get error details
+            try:
+                error_data = response.json()
+                error_msg = error_data.get('message', f'API error: {response.status_code}')
+                st.error(f"❌ OpenAlex API error ({response.status_code}): {error_msg}")
+            except:
+                st.error(f"❌ OpenAlex API error: {response.status_code}")
             return []
             
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ Network error connecting to OpenAlex: {str(e)}")
+        return []
     except Exception as e:
         st.error(f"❌ Error: {str(e)}")
         return []
@@ -282,8 +345,9 @@ Return only the numbers in order of relevance, separated by commas."""
         
         # Reorder papers
         ranked = [papers[i] for i in ranked_indices if 0 <= i < len(papers)]
-        # Add any papers not in ranking
-        remaining = [p for i, p in enumerate(papers) if i not in ranked_indices]
+        # Add any papers not in ranking (avoid duplicates)
+        ranked_indices_set = set(ranked_indices)
+        remaining = [p for i, p in enumerate(papers) if i not in ranked_indices_set]
         return ranked + remaining
     except:
         return papers
@@ -338,13 +402,16 @@ with col_search:
     # Data source selection
     data_source = st.radio(
         "Data Source",
-        ["Semantic Scholar API", "Local Papers"],
-        help="Choose between live search or local papers.json file",
+        ["Search Online", "Local Papers"],
+        help="Choose between live online search or local papers",
         key="data_source_selector"
     )
     
     # Note about loading time
-    st.caption("⏱️ Note: Processing may take 10-15 seconds (AI clustering & ranking)")
+    if data_source == "Search Online":
+        st.caption("⏱️ Note: Processing may take 10-15 seconds (AI clustering & ranking)")
+    else:
+        st.caption("⏱️ Note: Processing may take 10-15 seconds (AI clustering & ranking)")
     
     # Clear selected paper when switching data sources
     if data_source != st.session_state.get('last_data_source'):
@@ -352,14 +419,19 @@ with col_search:
             st.session_state.selected_paper_id = None
             # Clear AI explanations when switching to avoid showing wrong explanations
             st.session_state.ai_explanations = {}
+            # Clear rate limit timer when switching
+            st.session_state.rate_limit_time = None
+            # Clear current_papers when switching to ensure fresh data
+            if 'current_papers' in st.session_state:
+                del st.session_state.current_papers
     
     st.divider()
     
-    if data_source == "Semantic Scholar API":
+    if data_source == "Search Online":
         search_query = st.text_input(
             "Research Topic",
             placeholder="e.g. machine learning, transformer architectures",
-            help="Enter your research topic to search Semantic Scholar",
+            help="Enter your research topic to search online",
             key="main_search"
         )
         
@@ -372,7 +444,7 @@ with col_search:
             search_query = st.text_input(
                 "Filter Papers",
                 placeholder="Search within local papers...",
-                help="Filter papers from papers.json by title, abstract, or keywords",
+                help="Filter papers by title, abstract, or keywords",
                 key="local_search"
             )
         with col_filter2:
@@ -386,23 +458,12 @@ with col_search:
         
         search_clicked = st.button("🔍 Filter", type="primary", use_container_width=True)
     
-    # Check rate limit (only for Semantic Scholar)
-    if data_source == "Semantic Scholar API":
-        if st.session_state.rate_limit_time:
-            time_remaining = (st.session_state.rate_limit_time - datetime.datetime.now()).total_seconds()
-            if time_remaining > 0:
-                minutes = int(time_remaining // 60)
-                seconds = int(time_remaining % 60)
-                st.warning(f"⏰ Rate limited: {minutes}m {seconds}s remaining")
-            else:
-                # Rate limit expired - clear it
-                st.session_state.rate_limit_time = None
-                st.success("✅ Rate limit expired. You can search again!")
+    # OpenAlex has generous rate limits (10 req/sec) - no rate limit warnings needed
     
     st.divider()
     
-    # Year filter (only for Semantic Scholar)
-    if data_source == "Semantic Scholar API":
+    # Year filter (only for Search Online)
+    if data_source == "Search Online":
         year_filter_enabled = st.checkbox("Filter by Year", value=False)
         if year_filter_enabled:
             year_range = st.slider(
@@ -418,8 +479,8 @@ with col_search:
     
     st.divider()
     
-    # Cached searches (only for Semantic Scholar)
-    if data_source == "Semantic Scholar API" and st.session_state.cached_papers:
+    # Cached searches (only for Search Online)
+    if data_source == "Search Online" and st.session_state.cached_papers:
         st.subheader("📦 Recent Searches")
         for cached_query in list(st.session_state.cached_papers.keys())[:5]:
             if st.button(f"📄 {cached_query[:30]}...", key=f"cache_{cached_query}", use_container_width=True):
@@ -428,7 +489,7 @@ with col_search:
     
     # Show local papers info
     if data_source == "Local Papers":
-        st.info("💡 **Local Papers Mode**\n\nShowing papers from `papers.json` file. Use the filter box above to search within local papers.")
+        st.info("💡 **Local Papers Mode**\n\nShowing local papers. Use the filter box above to search within them.")
 
 # ==================== MIDDLE COLUMN: RESULTS (CLUSTERS & QUEUE) ====================
 with col_results:
@@ -465,10 +526,10 @@ with col_results:
                     normalized.append(normalized_paper)
                 return normalized
             except FileNotFoundError:
-                st.error("❌ papers.json file not found!")
+                st.error("❌ Local papers file not found!")
                 return []
             except json.JSONDecodeError as e:
-                st.error(f"❌ Invalid JSON in papers.json file: {str(e)}")
+                st.error(f"❌ Invalid JSON in local papers file: {str(e)}")
                 return []
         
         all_local_papers = load_local_papers()
@@ -503,7 +564,7 @@ with col_results:
             st.session_state.last_data_source = data_source
     
     else:
-        # Semantic Scholar API mode
+        # Search Online mode
         # Get year filter if set
         year_filter = None
         if "year_filter" in st.session_state:
@@ -514,52 +575,35 @@ with col_results:
                 else:
                     year_filter = str(year_range[0])
         
-        # Perform search
+        # Perform search - OpenAlex has generous rate limits, no need for rate limit checks
+        papers = []
         if search_query and (search_query != st.session_state.last_search_query or search_clicked):
-            # Check if we're still rate limited
-            if st.session_state.rate_limit_time:
-                time_remaining = (st.session_state.rate_limit_time - datetime.datetime.now()).total_seconds()
-                if time_remaining > 0:
-                    # Still rate limited - show message and use cached if available
-                    minutes_remaining = int(time_remaining // 60)
-                    seconds_remaining = int(time_remaining % 60)
-                    st.warning(f"⏰ Rate limited. Please wait {minutes_remaining}m {seconds_remaining}s before searching again.")
+            with st.spinner("🔍 Searching online..."):
+                papers = search_openalex(search_query, limit=20, year_filter=year_filter)
+                if papers:
+                    st.session_state.cached_papers[search_query.lower()] = papers
+                    st.session_state.last_search_query = search_query
                     
-                    # Use cached if available
-                    if search_query.lower() in st.session_state.cached_papers:
-                        papers = st.session_state.cached_papers[search_query.lower()]
-                        st.info(f"📦 Using cached results ({len(papers)} papers)")
-                    else:
-                        papers = []
-                else:
-                    # Rate limit expired - clear it and proceed
-                    st.session_state.rate_limit_time = None
-                    with st.spinner("🔍 Searching Semantic Scholar..."):
-                        papers = search_semantic_scholar(search_query, limit=20, year_filter=year_filter)
-                        if papers:
-                            st.session_state.cached_papers[search_query.lower()] = papers
-                            st.session_state.last_search_query = search_query
-                            
-                            # Rank papers (clustering removed for Semantic Scholar due to issues)
-                            with st.spinner("📊 Ranking papers by relevance..."):
-                                st.session_state.ranked_papers = rank_papers_by_relevance(papers, search_query)
-                            # Clear clusters for Semantic Scholar
-                            st.session_state.clusters = {}
-            else:
-                # No rate limit - proceed with search
-                with st.spinner("🔍 Searching Semantic Scholar..."):
-                    papers = search_semantic_scholar(search_query, limit=20, year_filter=year_filter)
-                    if papers:
-                        st.session_state.cached_papers[search_query.lower()] = papers
-                        st.session_state.last_search_query = search_query
-                        
-                        # Rank papers (clustering removed for Semantic Scholar due to issues)
-                        with st.spinner("📊 Ranking papers by relevance..."):
-                            st.session_state.ranked_papers = rank_papers_by_relevance(papers, search_query)
-                        # Clear clusters for Semantic Scholar
-                        st.session_state.clusters = {}
+                    # Rank papers (clustering removed for online search due to issues)
+                    with st.spinner("📊 Ranking papers by relevance..."):
+                        ranked_result = rank_papers_by_relevance(papers, search_query)
+                        # Remove duplicates from ranked results
+                        seen_ids = set()
+                        unique_ranked = []
+                        for p in ranked_result:
+                            pid = p.get('paperId') or p.get('id') or hash(f"{p.get('title', '')}_{p.get('year', '')}")
+                            if pid not in seen_ids:
+                                seen_ids.add(pid)
+                                unique_ranked.append(p)
+                        st.session_state.ranked_papers = unique_ranked
+                    # Clear clusters for online search
+                    st.session_state.clusters = {}
         elif search_query and search_query.lower() in st.session_state.cached_papers:
             papers = st.session_state.cached_papers[search_query.lower()]
+            # If we have ranked papers for this query, use those instead
+            if st.session_state.ranked_papers:
+                # Check if ranked papers match the current query
+                pass  # ranked_papers will be used in display
     
     # Note: Filters (include/exclude keywords, scope) have been removed per user request
     
@@ -586,11 +630,22 @@ with col_results:
             del st.session_state.current_papers
     
     # Display results
+    # Ensure papers list doesn't have duplicates before displaying
     if papers:
+        # Remove duplicates from papers list
+        seen_paper_ids = set()
+        unique_papers = []
+        for p in papers:
+            paper_id = p.get('paperId') or p.get('id') or hash(f"{p.get('title', '')}_{p.get('year', '')}")
+            if paper_id not in seen_paper_ids:
+                seen_paper_ids.add(paper_id)
+                unique_papers.append(p)
+        papers = unique_papers
+        
         st.header(f"📄 {len(papers)} Papers Found")
         
         # For Local Papers: Show both Clusters and Review Queue
-        # For Semantic Scholar: Show only Review Queue (clustering has issues)
+        # For Search Online: Show only Review Queue (clustering has issues)
         if data_source == "Local Papers":
             # Tabs for Clusters and Review Queue
             tab_clusters, tab_queue = st.tabs(["📚 Clusters", "📋 Review Queue"])
@@ -641,6 +696,12 @@ with col_results:
                     paper_id = paper.get('paperId') or paper.get('id')
                     if paper_id is None:
                         paper_id = hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                    # Ensure paper_id is a consistent type (string for OpenAlex IDs, keep as-is for others)
+                    if isinstance(paper_id, str) and paper_id.startswith('W'):
+                        # OpenAlex ID - keep as string
+                        pass
+                    elif paper_id is None:
+                        paper_id = hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
                     # Create unique key using index to avoid duplicates
                     unique_key = f"view_queue_{idx}_{paper_id}"
                     
@@ -667,17 +728,37 @@ with col_results:
                         
                         st.divider()
         else:
-            # Semantic Scholar: Only Review Queue (no clusters)
-            ranked = st.session_state.ranked_papers if st.session_state.ranked_papers else papers
+            # Search Online: Only Review Queue (no clusters)
+            # Use ranked papers if available, otherwise use papers
+            # But ensure we don't show duplicates
+            if st.session_state.ranked_papers:
+                ranked = st.session_state.ranked_papers
+            else:
+                ranked = papers
             
             st.caption("Papers ranked by relevance to your search")
             
-            for idx, paper in enumerate(ranked, 1):
-                # Get paper ID - use paperId if available, otherwise use id or hash
+            # Remove duplicates based on paper ID
+            seen_paper_ids = set()
+            unique_ranked = []
+            for paper in ranked:
+                paper_id = paper.get('paperId') or paper.get('id') or hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                if paper_id not in seen_paper_ids:
+                    seen_paper_ids.add(paper_id)
+                    unique_ranked.append(paper)
+            
+            for idx, paper in enumerate(unique_ranked, 1):
+                # Get paper ID - prioritize paperId for OpenAlex papers
                 # This must match exactly how we calculate it in paper details section
-                paper_id = paper.get('paperId') or paper.get('id')
-                if paper_id is None:
-                    paper_id = hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                paper_id = None
+                # For OpenAlex papers, use paperId first (it's the OpenAlex ID like "W123456789")
+                if paper.get('paperId') and isinstance(paper.get('paperId'), str) and paper.get('paperId').startswith('W'):
+                    paper_id = paper.get('paperId')
+                else:
+                    # For other papers, use paperId or id or hash
+                    paper_id = paper.get('paperId') or paper.get('id')
+                    if paper_id is None:
+                        paper_id = hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
                 
                 # Create unique key using index to avoid duplicates
                 unique_key = f"view_scholar_{idx}_{paper_id}"
@@ -699,47 +780,16 @@ with col_results:
                     
                     with col_q2:
                         if st.button("View", key=unique_key, use_container_width=True):
-                            # Store the paper ID consistently
-                            st.session_state.selected_paper_id = paper_id
-                            st.rerun()
-                    
-                    st.divider()
-            ranked = st.session_state.ranked_papers if st.session_state.ranked_papers else papers
-            
-            st.caption("Papers ranked by relevance to your search")
-            
-            for idx, paper in enumerate(ranked, 1):
-                paper_id = paper.get('id', hash(paper['title']))
-                
-                # Paper card
-                paper_selected = st.session_state.selected_paper_id == paper_id
-                card_style = "border: 2px solid #1f77b4;" if paper_selected else ""
-                
-                with st.container():
-                    col_q1, col_q2 = st.columns([4, 1])
-                    
-                    with col_q1:
-                        st.markdown(f"**{idx}. {paper['title']}**")
-                        authors_display = ', '.join(paper.get('authors', ['Unknown'])[:3])
-                        journal_display = paper.get('journal', 'N/A')
-                        year_display = paper.get('year', 'N/A')
-                        st.caption(f"{authors_display} • {journal_display} • {year_display}")
-                        if paper.get('citation_count'):
-                            st.caption(f"⭐ {paper['citation_count']} citations")
-                        elif paper.get('keywords'):
-                            st.caption(f"🏷️ {', '.join(paper['keywords'][:3])}")
-                    
-                    with col_q2:
-                        if st.button("View", key=f"view_{paper_id}", use_container_width=True):
+                            # Store the paper ID consistently - use paperId for OpenAlex papers
                             st.session_state.selected_paper_id = paper_id
                             st.rerun()
                     
                     st.divider()
     else:
         if data_source == "Local Papers":
-            st.info("📚 **Local Papers Mode**\n\nAll papers from `papers.json` are shown. Use the filter box to search within them.")
+            st.info("📚 **Local Papers Mode**\n\nAll local papers are shown. Use the filter box to search within them.")
         else:
-            st.info("👆 Enter a search query to find papers from Semantic Scholar")
+            st.info("👆 Enter a search query to find papers online")
 
 # ==================== RIGHT COLUMN: SELECTED PAPER DETAILS ====================
 with col_details:
@@ -749,66 +799,96 @@ with col_details:
     selected_paper = None
     all_papers = []
     
-    # Get papers from current data source - check multiple sources
-    # Collect all possible paper sources to ensure we find the selected paper
-    all_papers_sources = []
-    
-    # Add ranked papers if available
-    if st.session_state.ranked_papers:
-        all_papers_sources.extend(st.session_state.ranked_papers)
-    
-    # Add current papers if available
-    if st.session_state.get('current_papers'):
-        all_papers_sources.extend(st.session_state.current_papers)
-    
-    # Add all loaded papers as fallback
-    if st.session_state.get('all_loaded_papers'):
-        all_papers_sources.extend(st.session_state.all_loaded_papers)
-    
-    # Remove duplicates while preserving order (keep first occurrence)
-    seen_ids = set()
+    # Get papers from current data source only
+    # Only show paper details if the selected paper belongs to the current data source
     all_papers = []
-    for p in all_papers_sources:
-        # Calculate ID consistently
-        paper_id = p.get('paperId') or p.get('id')
-        if paper_id is None:
-            paper_id = hash(f"{p.get('title', '')}_{p.get('year', '')}")
-        
-        # Use a tuple of (paperId, id, title_hash) as unique identifier
-        unique_key = (
-            p.get('paperId'),
-            p.get('id'),
-            hash(f"{p.get('title', '')}_{p.get('year', '')}")
-        )
-        
-        if unique_key not in seen_ids:
-            seen_ids.add(unique_key)
-            all_papers.append(p)
+    
+    # Get papers based on current data source
+    if data_source == "Local Papers":
+        # For local papers, check current_papers first (most recent)
+        if st.session_state.get('current_papers'):
+            # Filter to only local papers (those without OpenAlex paperId starting with 'W')
+            all_papers = [p for p in st.session_state.current_papers 
+                         if not p.get('paperId') or not (isinstance(p.get('paperId'), str) and p.get('paperId').startswith('W'))]
+        elif st.session_state.get('all_loaded_papers'):
+            # Filter to only local papers (those without OpenAlex paperId format)
+            all_papers = [p for p in st.session_state.all_loaded_papers 
+                         if not p.get('paperId') or not (isinstance(p.get('paperId'), str) and p.get('paperId').startswith('W'))]
+    else:
+        # For Search Online, prioritize ranked_papers, then current_papers
+        # Use ranked_papers first as they're most recent and definitely from Search Online
+        if st.session_state.ranked_papers:
+            # Use ranked papers (these are definitely from Search Online)
+            all_papers = st.session_state.ranked_papers
+        elif st.session_state.get('current_papers'):
+            # Check if current_papers contains online papers (have paperId starting with 'W')
+            online_papers = [p for p in st.session_state.current_papers 
+                           if p.get('paperId') and isinstance(p.get('paperId'), str) and p.get('paperId').startswith('W')]
+            if online_papers:
+                all_papers = online_papers
+            else:
+                # If no online papers in current_papers, try all_loaded_papers
+                if st.session_state.get('all_loaded_papers'):
+                    all_papers = [p for p in st.session_state.all_loaded_papers 
+                                 if p.get('paperId') and isinstance(p.get('paperId'), str) and p.get('paperId').startswith('W')]
+                else:
+                    all_papers = []
+        else:
+            # No papers available yet
+            all_papers = []
     
     # Only show paper details if we have papers and a selected paper ID
+    # AND the selected paper belongs to the current data source
     if st.session_state.selected_paper_id and all_papers:
+        selected_id = st.session_state.selected_paper_id
+        
+        # Normalize selected_id for comparison
+        selected_id_str = str(selected_id) if selected_id else None
+        
         for p in all_papers:
-            # Calculate ID the same way as when setting it
-            paper_id = p.get('paperId') or p.get('id')
-            if paper_id is None:
-                paper_id = hash(f"{p.get('title', '')}_{p.get('year', '')}")
+            # Calculate ID the same way as when setting it (must match View button logic exactly)
+            paper_id = None
+            # For OpenAlex papers, prioritize paperId (it's the OpenAlex ID like "W123456789")
+            if p.get('paperId') and isinstance(p.get('paperId'), str) and p.get('paperId').startswith('W'):
+                paper_id = p.get('paperId')
+            else:
+                # For other papers, use paperId or id or hash
+                paper_id = p.get('paperId') or p.get('id')
+                if paper_id is None:
+                    paper_id = hash(f"{p.get('title', '')}_{p.get('year', '')}")
             
-            # Match by ID (exact match)
-            if paper_id == st.session_state.selected_paper_id:
+            paper_id_str = str(paper_id) if paper_id else None
+            
+            # Try multiple matching strategies (prioritize most specific first)
+            # 1. Direct match (exact) - this should work for OpenAlex IDs
+            if paper_id == selected_id:
                 selected_paper = p
                 break
             
-            # Also try matching by hash of title+year as fallback
-            title_hash = hash(f"{p.get('title', '')}_{p.get('year', '')}")
-            if title_hash == st.session_state.selected_paper_id:
+            # 2. String comparison (handles type mismatches)
+            if paper_id_str and selected_id_str and paper_id_str == selected_id_str:
                 selected_paper = p
                 break
             
-            # Also try matching by paperId string if selected_paper_id is a string
-            if isinstance(st.session_state.selected_paper_id, str):
-                if p.get('paperId') == st.session_state.selected_paper_id:
+            # 3. For OpenAlex papers (IDs starting with 'W'), match paperId directly
+            if isinstance(selected_id, str) and selected_id.startswith('W'):
+                paper_paperId = p.get('paperId')
+                if paper_paperId == selected_id:
                     selected_paper = p
                     break
+                if isinstance(paper_paperId, str) and paper_paperId == selected_id:
+                    selected_paper = p
+                    break
+                # Also try string comparison
+                if paper_paperId and str(paper_paperId) == selected_id:
+                    selected_paper = p
+                    break
+            
+            # 4. Match by hash of title+year as fallback
+            title_hash = hash(f"{p.get('title', '')}_{p.get('year', '')}")
+            if title_hash == selected_id or (selected_id_str and str(title_hash) == selected_id_str):
+                selected_paper = p
+                break
     
     if selected_paper:
         # Paper header
@@ -847,7 +927,7 @@ with col_details:
         
         # URL
         if selected_paper.get('url'):
-            st.markdown(f"[🔗 View on Semantic Scholar]({selected_paper['url']})")
+            st.markdown(f"[🔗 View Paper]({selected_paper['url']})")
         
         st.divider()
         
@@ -867,7 +947,7 @@ with col_details:
                     try:
                         # Use appropriate query based on data source
                         query_for_explanation = ""
-                        if data_source == "Semantic Scholar API":
+                        if data_source == "Search Online":
                             query_for_explanation = st.session_state.get('last_search_query', '')
                         else:
                             query_for_explanation = st.session_state.get('local_search', '') or "research papers"
@@ -921,8 +1001,16 @@ with col_details:
             st.caption("Click 'Explain Relevance' button above to get AI-generated relevance explanation")
     
     else:
+        # Check if selected paper ID exists but doesn't belong to current data source
+        if st.session_state.selected_paper_id and not selected_paper:
+            # Clear the selected paper ID if it doesn't belong to current data source
+            st.session_state.selected_paper_id = None
+        
         if not all_papers:
-            st.info("👈 Search for papers or select Local Papers to view details")
+            if data_source == "Local Papers":
+                st.info("👈 Load local papers to view details")
+            else:
+                st.info("👈 Search for papers online to view details")
         else:
             st.info("👈 Select a paper from the results to view details")
 
