@@ -94,7 +94,7 @@ def search_openalex(query: str, limit: int = 20, year_filter: str = None, min_ci
     try:
         # Make request with proper headers
         headers = {
-            'User-Agent': 'LiteratureReviewApp/1.0 (mailto:user@example.com)'  # OpenAlex prefers identifying user agents
+            'User-Agent': 'LitSense/1.0 (mailto:user@example.com)'  # OpenAlex prefers identifying user agents
         }
         
         # Debug: Log the request URL (remove in production)
@@ -355,7 +355,7 @@ Return only the numbers in order of relevance, separated by commas."""
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="Literature Review Assistant", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="LitSense", layout="wide", initial_sidebar_state="collapsed")
 
 # Initialize session state
 if "selected_papers" not in st.session_state:

@@ -1,4 +1,4 @@
-# Literature Review Assistant 📚
+# LitSense 📚
 
 A Streamlit application for searching, organizing, and managing academic papers with AI-powered clustering, ranking, and relevance analysis.
 
