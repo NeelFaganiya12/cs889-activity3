@@ -87,8 +87,11 @@ def search_semantic_scholar(query: str, limit: int = 20, year_filter: str = None
                 # Extract fields of study
                 fields_of_study = paper.get('fieldsOfStudy', [])
                 
+                # Use paperId from Semantic Scholar as primary ID, or create unique hash
+                unique_id = paper.get('paperId') or hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                
                 paper_obj = {
-                    "id": idx,
+                    "id": unique_id,  # Use unique ID instead of sequential idx
                     "paperId": paper.get('paperId', ''),
                     "title": paper.get('title', 'Untitled'),
                     "authors": authors if authors else ["Unknown"],
@@ -107,12 +110,44 @@ def search_semantic_scholar(query: str, limit: int = 20, year_filter: str = None
             return papers
         
         elif response.status_code == 429:
-            retry_after = int(response.headers.get('Retry-After', 300))
-            st.session_state.rate_limit_time = datetime.datetime.now() + datetime.timedelta(seconds=retry_after)
+            # Get retry-after header (in seconds), default to 5 minutes if not provided
+            retry_after_header = response.headers.get('Retry-After')
+            if retry_after_header:
+                try:
+                    retry_after = int(retry_after_header)
+                except:
+                    retry_after = 300  # Default to 5 minutes
+            else:
+                # If no Retry-After header, use a conservative 5 minutes
+                retry_after = 300
+            
+            # Only update rate limit time if we don't already have one set (don't reset timer)
+            if not st.session_state.rate_limit_time:
+                # Set rate limit expiration time
+                st.session_state.rate_limit_time = datetime.datetime.now() + datetime.timedelta(seconds=retry_after)
+            
+            # Calculate remaining time
+            if st.session_state.rate_limit_time:
+                time_remaining = (st.session_state.rate_limit_time - datetime.datetime.now()).total_seconds()
+                if time_remaining > 0:
+                    minutes = int(time_remaining // 60)
+                    seconds = int(time_remaining % 60)
+                else:
+                    minutes = retry_after // 60
+                    seconds = retry_after % 60
+            else:
+                minutes = retry_after // 60
+                seconds = retry_after % 60
+            
             st.error(f"""
             ❌ **Rate Limit Exceeded (429)**
             
-            Please wait {retry_after // 60} minutes before trying again.
+            Semantic Scholar API rate limit reached. Please wait **{minutes} minutes {seconds} seconds** before trying again.
+            
+            **Tip:** 
+            - Use cached results from previous searches (shown below)
+            - Switch to "Local Papers" mode for instant access
+            - The timer will automatically clear when the rate limit expires
             """)
             return []
         
@@ -352,12 +387,17 @@ with col_search:
         search_clicked = st.button("🔍 Filter", type="primary", use_container_width=True)
     
     # Check rate limit (only for Semantic Scholar)
-    if data_source == "Semantic Scholar API" and st.session_state.rate_limit_time:
-        time_remaining = (st.session_state.rate_limit_time - datetime.datetime.now()).total_seconds()
-        if time_remaining > 0:
-            st.warning(f"⏰ Rate limited: {int(time_remaining // 60)}m {int(time_remaining % 60)}s")
-        else:
-            st.session_state.rate_limit_time = None
+    if data_source == "Semantic Scholar API":
+        if st.session_state.rate_limit_time:
+            time_remaining = (st.session_state.rate_limit_time - datetime.datetime.now()).total_seconds()
+            if time_remaining > 0:
+                minutes = int(time_remaining // 60)
+                seconds = int(time_remaining % 60)
+                st.warning(f"⏰ Rate limited: {minutes}m {seconds}s remaining")
+            else:
+                # Rate limit expired - clear it
+                st.session_state.rate_limit_time = None
+                st.success("✅ Rate limit expired. You can search again!")
     
     st.divider()
     
@@ -476,7 +516,37 @@ with col_results:
         
         # Perform search
         if search_query and (search_query != st.session_state.last_search_query or search_clicked):
-            if not st.session_state.rate_limit_time or (st.session_state.rate_limit_time and (st.session_state.rate_limit_time - datetime.datetime.now()).total_seconds() <= 0):
+            # Check if we're still rate limited
+            if st.session_state.rate_limit_time:
+                time_remaining = (st.session_state.rate_limit_time - datetime.datetime.now()).total_seconds()
+                if time_remaining > 0:
+                    # Still rate limited - show message and use cached if available
+                    minutes_remaining = int(time_remaining // 60)
+                    seconds_remaining = int(time_remaining % 60)
+                    st.warning(f"⏰ Rate limited. Please wait {minutes_remaining}m {seconds_remaining}s before searching again.")
+                    
+                    # Use cached if available
+                    if search_query.lower() in st.session_state.cached_papers:
+                        papers = st.session_state.cached_papers[search_query.lower()]
+                        st.info(f"📦 Using cached results ({len(papers)} papers)")
+                    else:
+                        papers = []
+                else:
+                    # Rate limit expired - clear it and proceed
+                    st.session_state.rate_limit_time = None
+                    with st.spinner("🔍 Searching Semantic Scholar..."):
+                        papers = search_semantic_scholar(search_query, limit=20, year_filter=year_filter)
+                        if papers:
+                            st.session_state.cached_papers[search_query.lower()] = papers
+                            st.session_state.last_search_query = search_query
+                            
+                            # Rank papers (clustering removed for Semantic Scholar due to issues)
+                            with st.spinner("📊 Ranking papers by relevance..."):
+                                st.session_state.ranked_papers = rank_papers_by_relevance(papers, search_query)
+                            # Clear clusters for Semantic Scholar
+                            st.session_state.clusters = {}
+            else:
+                # No rate limit - proceed with search
                 with st.spinner("🔍 Searching Semantic Scholar..."):
                     papers = search_semantic_scholar(search_query, limit=20, year_filter=year_filter)
                     if papers:
@@ -488,11 +558,6 @@ with col_results:
                             st.session_state.ranked_papers = rank_papers_by_relevance(papers, search_query)
                         # Clear clusters for Semantic Scholar
                         st.session_state.clusters = {}
-            else:
-                # Use cached if available
-                if search_query.lower() in st.session_state.cached_papers:
-                    papers = st.session_state.cached_papers[search_query.lower()]
-                    st.info(f"📦 Using cached results ({len(papers)} papers)")
         elif search_query and search_query.lower() in st.session_state.cached_papers:
             papers = st.session_state.cached_papers[search_query.lower()]
     
@@ -504,9 +569,14 @@ with col_results:
         st.session_state.current_papers = papers
         
         # Update all_loaded_papers with current papers (avoid duplicates)
-        seen_ids = {p.get('id', hash(p.get('title', ''))) for p in st.session_state.all_loaded_papers}
+        # Use paperId or create unique hash for comparison
+        seen_ids = set()
+        for p in st.session_state.all_loaded_papers:
+            pid = p.get('paperId') or p.get('id') or hash(f"{p.get('title', '')}_{p.get('year', '')}")
+            seen_ids.add(pid)
+        
         for p in papers:
-            paper_id = p.get('id', hash(p.get('title', '')))
+            paper_id = p.get('paperId') or p.get('id') or hash(f"{p.get('title', '')}_{p.get('year', '')}")
             if paper_id not in seen_ids:
                 st.session_state.all_loaded_papers.append(p)
                 seen_ids.add(paper_id)
@@ -534,12 +604,15 @@ with col_results:
                                 if cluster_data.get("topics"):
                                     st.caption(f"Topics: {', '.join(cluster_data['topics'][:5])}")
                                 
-                                for paper in cluster_papers_list:
-                                    paper_id = paper.get('id', hash(paper['title']))
+                                for cluster_idx, paper in enumerate(cluster_papers_list):
+                                    # Get paper ID - use paperId if available, otherwise use id or hash
+                                    paper_id = paper.get('paperId') or paper.get('id') or hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                                    # Create unique key using cluster name and index
+                                    unique_cluster_key = f"select_{cluster_name}_{cluster_idx}_{paper_id}"
                                     col_paper1, col_paper2 = st.columns([4, 1])
                                     
                                     with col_paper1:
-                                        if st.button(f"📄 {paper['title'][:60]}...", key=f"select_{paper_id}_cluster", use_container_width=True):
+                                        if st.button(f"📄 {paper['title'][:60]}...", key=unique_cluster_key, use_container_width=True):
                                             st.session_state.selected_paper_id = paper_id
                                             st.rerun()
                                     
@@ -563,7 +636,13 @@ with col_results:
                 st.caption("Papers ranked by relevance to your search")
                 
                 for idx, paper in enumerate(ranked, 1):
-                    paper_id = paper.get('id', hash(paper['title']))
+                    # Get paper ID - use paperId if available, otherwise use id or hash
+                    # This must match exactly how we calculate it in paper details section
+                    paper_id = paper.get('paperId') or paper.get('id')
+                    if paper_id is None:
+                        paper_id = hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                    # Create unique key using index to avoid duplicates
+                    unique_key = f"view_queue_{idx}_{paper_id}"
                     
                     # Paper card
                     paper_selected = st.session_state.selected_paper_id == paper_id
@@ -581,7 +660,8 @@ with col_results:
                                 st.caption(f"🏷️ {', '.join(paper['keywords'][:3])}")
                         
                         with col_q2:
-                            if st.button("View", key=f"view_{paper_id}", use_container_width=True):
+                            if st.button("View", key=unique_key, use_container_width=True):
+                                # Store the paper ID consistently
                                 st.session_state.selected_paper_id = paper_id
                                 st.rerun()
                         
@@ -593,7 +673,14 @@ with col_results:
             st.caption("Papers ranked by relevance to your search")
             
             for idx, paper in enumerate(ranked, 1):
-                paper_id = paper.get('id', hash(paper['title']))
+                # Get paper ID - use paperId if available, otherwise use id or hash
+                # This must match exactly how we calculate it in paper details section
+                paper_id = paper.get('paperId') or paper.get('id')
+                if paper_id is None:
+                    paper_id = hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                
+                # Create unique key using index to avoid duplicates
+                unique_key = f"view_scholar_{idx}_{paper_id}"
                 
                 # Paper card
                 paper_selected = st.session_state.selected_paper_id == paper_id
@@ -611,7 +698,8 @@ with col_results:
                             st.caption(f"🏷️ {', '.join(paper['keywords'][:3])}")
                     
                     with col_q2:
-                        if st.button("View", key=f"view_{paper_id}", use_container_width=True):
+                        if st.button("View", key=unique_key, use_container_width=True):
+                            # Store the paper ID consistently
                             st.session_state.selected_paper_id = paper_id
                             st.rerun()
                     
@@ -661,23 +749,66 @@ with col_details:
     selected_paper = None
     all_papers = []
     
-    # Get papers from current data source
-    all_papers = []
+    # Get papers from current data source - check multiple sources
+    # Collect all possible paper sources to ensure we find the selected paper
+    all_papers_sources = []
     
-    # First check ranked papers
+    # Add ranked papers if available
     if st.session_state.ranked_papers:
-        all_papers = st.session_state.ranked_papers
-    # Then check current papers from session state
-    elif st.session_state.get('current_papers'):
-        all_papers = st.session_state.current_papers
+        all_papers_sources.extend(st.session_state.ranked_papers)
+    
+    # Add current papers if available
+    if st.session_state.get('current_papers'):
+        all_papers_sources.extend(st.session_state.current_papers)
+    
+    # Add all loaded papers as fallback
+    if st.session_state.get('all_loaded_papers'):
+        all_papers_sources.extend(st.session_state.all_loaded_papers)
+    
+    # Remove duplicates while preserving order (keep first occurrence)
+    seen_ids = set()
+    all_papers = []
+    for p in all_papers_sources:
+        # Calculate ID consistently
+        paper_id = p.get('paperId') or p.get('id')
+        if paper_id is None:
+            paper_id = hash(f"{p.get('title', '')}_{p.get('year', '')}")
+        
+        # Use a tuple of (paperId, id, title_hash) as unique identifier
+        unique_key = (
+            p.get('paperId'),
+            p.get('id'),
+            hash(f"{p.get('title', '')}_{p.get('year', '')}")
+        )
+        
+        if unique_key not in seen_ids:
+            seen_ids.add(unique_key)
+            all_papers.append(p)
     
     # Only show paper details if we have papers and a selected paper ID
     if st.session_state.selected_paper_id and all_papers:
         for p in all_papers:
-            paper_id = p.get('id', hash(p['title']))
+            # Calculate ID the same way as when setting it
+            paper_id = p.get('paperId') or p.get('id')
+            if paper_id is None:
+                paper_id = hash(f"{p.get('title', '')}_{p.get('year', '')}")
+            
+            # Match by ID (exact match)
             if paper_id == st.session_state.selected_paper_id:
                 selected_paper = p
                 break
+            
+            # Also try matching by hash of title+year as fallback
+            title_hash = hash(f"{p.get('title', '')}_{p.get('year', '')}")
+            if title_hash == st.session_state.selected_paper_id:
+                selected_paper = p
+                break
+            
+            # Also try matching by paperId string if selected_paper_id is a string
+            if isinstance(st.session_state.selected_paper_id, str):
+                if p.get('paperId') == st.session_state.selected_paper_id:
+                    selected_paper = p
+                    break
     
     if selected_paper:
         # Paper header
