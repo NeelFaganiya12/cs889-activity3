@@ -26,6 +26,25 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("models/gemini-2.5-flash")
 
 # -----------------------------
+# Helper Functions
+# -----------------------------
+def get_consistent_paper_id(paper):
+    """
+    Return a stable, consistent paper ID for all papers.
+    Works for:
+    - OpenAlex papers (paperId like 'W123456789')
+    - Local papers (numeric id)
+    - Fallback (hash of title + year)
+    """
+    if paper.get("paperId") and isinstance(paper["paperId"], str):
+        return str(paper["paperId"])
+
+    if paper.get("id") is not None:
+        return str(paper["id"])
+
+    return str(hash(f"{paper.get('title','')}_{paper.get('year','')}"))
+
+# -----------------------------
 # OpenAlex API functions
 # -----------------------------
 def search_openalex(query: str, limit: int = 20, year_filter: str = None, min_citations: int = None):
@@ -289,6 +308,39 @@ Topics: [keywords]
         return {}
 
 # -----------------------------
+# AI helper - Summarize paper
+# -----------------------------
+def summarize_paper(paper):
+    """Generate a concise summary of a paper using Gemini"""
+    if not paper or not GEMINI_API_KEY:
+        return "Summary not available"
+    
+    try:
+        authors_str = ", ".join(paper.get('authors', ['Unknown'])[:3])
+        
+        prompt = f"""Provide a concise 2-3 sentence summary of this research paper.
+
+Title: {paper.get('title', 'N/A')}
+Authors: {authors_str}
+Year: {paper.get('year', 'N/A')}
+Journal: {paper.get('journal', 'N/A')}
+
+Abstract:
+{paper.get('abstract', 'No abstract available')}
+
+Focus on:
+1. What problem/question does this paper address?
+2. What is the main contribution or finding?
+3. Why is this important?
+
+Keep it brief and informative."""
+        
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"Error generating summary: {str(e)}"
+
+# -----------------------------
 # AI helper - Explain relevance
 # -----------------------------
 def explain_relevance(paper, user_query=""):
@@ -362,6 +414,10 @@ if "selected_papers" not in st.session_state:
     st.session_state.selected_papers = []
 if "ai_explanations" not in st.session_state:
     st.session_state.ai_explanations = {}
+if "paper_summaries" not in st.session_state:
+    st.session_state.paper_summaries = {}  # Cache for paper summaries
+if "scroll_to_section" not in st.session_state:
+    st.session_state.scroll_to_section = None  # Track which section to scroll to
 if "cached_papers" not in st.session_state:
     st.session_state.cached_papers = {}
 if "last_search_query" not in st.session_state:
@@ -413,17 +469,18 @@ with col_search:
     else:
         st.caption("⏱️ Note: Processing may take 10-15 seconds (AI clustering & ranking)")
     
-    # Clear selected paper when switching data sources
+    # Reset state when switching data sources
     if data_source != st.session_state.get('last_data_source'):
         if st.session_state.get('last_data_source') is not None:
             st.session_state.selected_paper_id = None
-            # Clear AI explanations when switching to avoid showing wrong explanations
             st.session_state.ai_explanations = {}
+            st.session_state.paper_summaries = {}
+            st.session_state.current_papers = []
+            st.session_state.clusters = {}
+            st.session_state.ranked_papers = []
             # Clear rate limit timer when switching
             st.session_state.rate_limit_time = None
-            # Clear current_papers when switching to ensure fresh data
-            if 'current_papers' in st.session_state:
-                del st.session_state.current_papers
+        st.session_state.last_data_source = data_source
     
     st.divider()
     
@@ -591,7 +648,7 @@ with col_results:
                         seen_ids = set()
                         unique_ranked = []
                         for p in ranked_result:
-                            pid = p.get('paperId') or p.get('id') or hash(f"{p.get('title', '')}_{p.get('year', '')}")
+                            pid = get_consistent_paper_id(p)
                             if pid not in seen_ids:
                                 seen_ids.add(pid)
                                 unique_ranked.append(p)
@@ -636,7 +693,7 @@ with col_results:
         seen_paper_ids = set()
         unique_papers = []
         for p in papers:
-            paper_id = p.get('paperId') or p.get('id') or hash(f"{p.get('title', '')}_{p.get('year', '')}")
+            paper_id = get_consistent_paper_id(p)
             if paper_id not in seen_paper_ids:
                 seen_paper_ids.add(paper_id)
                 unique_papers.append(p)
@@ -660,8 +717,8 @@ with col_results:
                                     st.caption(f"Topics: {', '.join(cluster_data['topics'][:5])}")
                                 
                                 for cluster_idx, paper in enumerate(cluster_papers_list):
-                                    # Get paper ID - use paperId if available, otherwise use id or hash
-                                    paper_id = paper.get('paperId') or paper.get('id') or hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                                    # Get paper ID using consistent function
+                                    paper_id = get_consistent_paper_id(paper)
                                     # Create unique key using cluster name and index
                                     unique_cluster_key = f"select_{cluster_name}_{cluster_idx}_{paper_id}"
                                     col_paper1, col_paper2 = st.columns([4, 1])
@@ -691,17 +748,8 @@ with col_results:
                 st.caption("Papers ranked by relevance to your search")
                 
                 for idx, paper in enumerate(ranked, 1):
-                    # Get paper ID - use paperId if available, otherwise use id or hash
-                    # This must match exactly how we calculate it in paper details section
-                    paper_id = paper.get('paperId') or paper.get('id')
-                    if paper_id is None:
-                        paper_id = hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
-                    # Ensure paper_id is a consistent type (string for OpenAlex IDs, keep as-is for others)
-                    if isinstance(paper_id, str) and paper_id.startswith('W'):
-                        # OpenAlex ID - keep as string
-                        pass
-                    elif paper_id is None:
-                        paper_id = hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                    # Get paper ID using consistent function
+                    paper_id = get_consistent_paper_id(paper)
                     # Create unique key using index to avoid duplicates
                     unique_key = f"view_queue_{idx}_{paper_id}"
                     
@@ -713,7 +761,10 @@ with col_results:
                         col_q1, col_q2 = st.columns([4, 1])
                         
                         with col_q1:
-                            st.markdown(f"**{idx}. {paper['title']}**")
+                            # Make title clickable (like local papers)
+                            if st.button(f"📄 {idx}. {paper['title'][:70]}...", key=unique_key, use_container_width=True):
+                                st.session_state.selected_paper_id = paper_id
+                                st.rerun()
                             st.caption(f"{', '.join(paper.get('authors', ['Unknown'])[:3])} • {paper.get('journal', 'N/A')} • {paper.get('year', 'N/A')}")
                             if paper.get('citation_count'):
                                 st.caption(f"⭐ {paper['citation_count']} citations")
@@ -721,10 +772,9 @@ with col_results:
                                 st.caption(f"🏷️ {', '.join(paper['keywords'][:3])}")
                         
                         with col_q2:
-                            if st.button("View", key=unique_key, use_container_width=True):
-                                # Store the paper ID consistently
-                                st.session_state.selected_paper_id = paper_id
-                                st.rerun()
+                            # Show citation count or other info in right column
+                            if paper.get('citation_count'):
+                                st.caption(f"⭐ {paper['citation_count']}")
                         
                         st.divider()
         else:
@@ -742,36 +792,28 @@ with col_results:
             seen_paper_ids = set()
             unique_ranked = []
             for paper in ranked:
-                paper_id = paper.get('paperId') or paper.get('id') or hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
+                paper_id = get_consistent_paper_id(paper)
                 if paper_id not in seen_paper_ids:
                     seen_paper_ids.add(paper_id)
                     unique_ranked.append(paper)
             
             for idx, paper in enumerate(unique_ranked, 1):
-                # Get paper ID - prioritize paperId for OpenAlex papers
-                # This must match exactly how we calculate it in paper details section
-                paper_id = None
-                # For OpenAlex papers, use paperId first (it's the OpenAlex ID like "W123456789")
-                if paper.get('paperId') and isinstance(paper.get('paperId'), str) and paper.get('paperId').startswith('W'):
-                    paper_id = paper.get('paperId')
-                else:
-                    # For other papers, use paperId or id or hash
-                    paper_id = paper.get('paperId') or paper.get('id')
-                    if paper_id is None:
-                        paper_id = hash(f"{paper.get('title', '')}_{paper.get('year', '')}")
-                
+                # Get paper ID using consistent function
+                paper_id = get_consistent_paper_id(paper)
                 # Create unique key using index to avoid duplicates
                 unique_key = f"view_scholar_{idx}_{paper_id}"
                 
-                # Paper card
+                # Paper card - clickable title like in local papers
                 paper_selected = st.session_state.selected_paper_id == paper_id
-                card_style = "border: 2px solid #1f77b4;" if paper_selected else ""
                 
                 with st.container():
                     col_q1, col_q2 = st.columns([4, 1])
                     
                     with col_q1:
-                        st.markdown(f"**{idx}. {paper['title']}**")
+                        # Make title clickable (like local papers)
+                        if st.button(f"📄 {idx}. {paper['title'][:70]}...", key=unique_key, use_container_width=True):
+                            st.session_state.selected_paper_id = paper_id
+                            st.rerun()
                         st.caption(f"{', '.join(paper.get('authors', ['Unknown'])[:3])} • {paper.get('journal', 'N/A')} • {paper.get('year', 'N/A')}")
                         if paper.get('citation_count'):
                             st.caption(f"⭐ {paper['citation_count']} citations")
@@ -779,10 +821,9 @@ with col_results:
                             st.caption(f"🏷️ {', '.join(paper['keywords'][:3])}")
                     
                     with col_q2:
-                        if st.button("View", key=unique_key, use_container_width=True):
-                            # Store the paper ID consistently - use paperId for OpenAlex papers
-                            st.session_state.selected_paper_id = paper_id
-                            st.rerun()
+                        # Show citation count or other info in right column
+                        if paper.get('citation_count'):
+                            st.caption(f"⭐ {paper['citation_count']}")
                     
                     st.divider()
     else:
@@ -837,56 +878,13 @@ with col_details:
             # No papers available yet
             all_papers = []
     
-    # Only show paper details if we have papers and a selected paper ID
-    # AND the selected paper belongs to the current data source
+    # Fix Paper Selection Matching Logic
+    selected_paper = None
     if st.session_state.selected_paper_id and all_papers:
-        selected_id = st.session_state.selected_paper_id
-        
-        # Normalize selected_id for comparison
-        selected_id_str = str(selected_id) if selected_id else None
+        selected_id = str(st.session_state.selected_paper_id)
         
         for p in all_papers:
-            # Calculate ID the same way as when setting it (must match View button logic exactly)
-            paper_id = None
-            # For OpenAlex papers, prioritize paperId (it's the OpenAlex ID like "W123456789")
-            if p.get('paperId') and isinstance(p.get('paperId'), str) and p.get('paperId').startswith('W'):
-                paper_id = p.get('paperId')
-            else:
-                # For other papers, use paperId or id or hash
-                paper_id = p.get('paperId') or p.get('id')
-                if paper_id is None:
-                    paper_id = hash(f"{p.get('title', '')}_{p.get('year', '')}")
-            
-            paper_id_str = str(paper_id) if paper_id else None
-            
-            # Try multiple matching strategies (prioritize most specific first)
-            # 1. Direct match (exact) - this should work for OpenAlex IDs
-            if paper_id == selected_id:
-                selected_paper = p
-                break
-            
-            # 2. String comparison (handles type mismatches)
-            if paper_id_str and selected_id_str and paper_id_str == selected_id_str:
-                selected_paper = p
-                break
-            
-            # 3. For OpenAlex papers (IDs starting with 'W'), match paperId directly
-            if isinstance(selected_id, str) and selected_id.startswith('W'):
-                paper_paperId = p.get('paperId')
-                if paper_paperId == selected_id:
-                    selected_paper = p
-                    break
-                if isinstance(paper_paperId, str) and paper_paperId == selected_id:
-                    selected_paper = p
-                    break
-                # Also try string comparison
-                if paper_paperId and str(paper_paperId) == selected_id:
-                    selected_paper = p
-                    break
-            
-            # 4. Match by hash of title+year as fallback
-            title_hash = hash(f"{p.get('title', '')}_{p.get('year', '')}")
-            if title_hash == selected_id or (selected_id_str and str(title_hash) == selected_id_str):
+            if get_consistent_paper_id(p) == selected_id:
                 selected_paper = p
                 break
     
@@ -931,18 +929,32 @@ with col_details:
         
         st.divider()
         
+        # Get paper ID consistently using the helper function
+        paper_id = get_consistent_paper_id(selected_paper)
+        
         # Action buttons
-        col_btn1, col_btn2 = st.columns(2)
+        col_btn1, col_btn2, col_btn3 = st.columns(3)
         
         with col_btn1:
-            if st.button("➕ Add to List", key=f"add_{selected_paper.get('id')}", use_container_width=True, type="primary"):
+            if st.button("➕ Add to List", key=f"add_{paper_id}", use_container_width=True, type="primary"):
                 if selected_paper not in st.session_state.selected_papers:
                     st.session_state.selected_papers.append(selected_paper)
                     st.success("Added!")
                     st.rerun()
         
         with col_btn2:
-            if st.button("🤖 Explain Relevance", key=f"explain_{selected_paper.get('id')}", use_container_width=True):
+            if st.button("📝 Summarize", key=f"summarize_{paper_id}", use_container_width=True):
+                with st.spinner("Generating summary..."):
+                    try:
+                        summary = summarize_paper(selected_paper)
+                        st.session_state.paper_summaries[paper_id] = summary
+                        st.session_state.scroll_to_section = "summary"  # Trigger scroll to summary
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {str(e)}")
+        
+        with col_btn3:
+            if st.button("🤖 Explain Relevance", key=f"explain_{paper_id}", use_container_width=True):
                 with st.spinner("Generating explanation..."):
                     try:
                         # Use appropriate query based on data source
@@ -953,17 +965,53 @@ with col_details:
                             query_for_explanation = st.session_state.get('local_search', '') or "research papers"
                         
                         explanation = explain_relevance(selected_paper, query_for_explanation)
-                        st.session_state.ai_explanations[selected_paper.get('id')] = explanation
+                        st.session_state.ai_explanations[paper_id] = explanation
+                        st.session_state.scroll_to_section = "explanation"  # Trigger scroll to explanation
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error: {str(e)}")
         
         st.divider()
         
+        # AI Summary Section (show if available)
+        if paper_id in st.session_state.paper_summaries:
+            # Add anchor for scrolling
+            st.markdown(f'<div id="summary_{paper_id}"></div>', unsafe_allow_html=True)
+            st.subheader("📝 AI Summary")
+            st.info(st.session_state.paper_summaries[paper_id])
+            st.divider()
+        
+        # AI Explanation Section (show if available)
+        if paper_id in st.session_state.ai_explanations:
+            # Add anchor for scrolling
+            st.markdown(f'<div id="explanation_{paper_id}"></div>', unsafe_allow_html=True)
+            st.subheader("🤖 AI Explanation")
+            st.info(st.session_state.ai_explanations[paper_id])
+            st.divider()
+        
+        # Scroll script injection (after sections are rendered)
+        if st.session_state.scroll_to_section:
+            scroll_target = st.session_state.scroll_to_section
+            target_id = f"{scroll_target}_{paper_id}"
+            st.session_state.scroll_to_section = None  # Clear the trigger
+            
+            scroll_script = f"""
+            <script>
+                (function() {{
+                    setTimeout(function() {{
+                        const element = document.getElementById('{target_id}');
+                        if (element) {{
+                            element.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                        }}
+                    }}, 300);
+                }})();
+            </script>
+            """
+            st.markdown(scroll_script, unsafe_allow_html=True)
+        
         # User Feedback Section
         st.subheader("💬 Feedback")
         
-        paper_id = selected_paper.get('id')
         feedback_key = f"feedback_{paper_id}"
         
         if feedback_key not in st.session_state.paper_feedback:
@@ -989,16 +1037,6 @@ with col_details:
         if st.button("💾 Save Note", key=f"save_note_{paper_id}"):
             st.session_state.paper_feedback[feedback_key]["note"] = note
             st.success("Note saved!")
-        
-        st.divider()
-        
-        # AI Explanation
-        st.subheader("🤖 AI Explanation")
-        
-        if paper_id in st.session_state.ai_explanations:
-            st.info(st.session_state.ai_explanations[paper_id])
-        else:
-            st.caption("Click 'Explain Relevance' button above to get AI-generated relevance explanation")
     
     else:
         # Check if selected paper ID exists but doesn't belong to current data source
@@ -1051,14 +1089,14 @@ def get_papers_with_feedback():
     seen_ids = set()
     unique_papers = []
     for p in all_available_papers:
-        paper_id = p.get('id', hash(p.get('title', '')))
+        paper_id = get_consistent_paper_id(p)
         if paper_id not in seen_ids:
             seen_ids.add(paper_id)
             unique_papers.append(p)
     
     # Check feedback for each paper
     for paper in unique_papers:
-        paper_id = paper.get('id', hash(paper.get('title', '')))
+        paper_id = get_consistent_paper_id(paper)
         feedback_key = f"feedback_{paper_id}"
         
         if feedback_key in st.session_state.paper_feedback:
@@ -1091,7 +1129,7 @@ if relevant_papers or not_relevant_papers:
             for idx, item in enumerate(relevant_papers, 1):
                 paper = item["paper"]
                 note = item["note"]
-                paper_id = paper.get('id', hash(paper.get('title', '')))
+                paper_id = get_consistent_paper_id(paper)
                 
                 with st.expander(f"{idx}. **{paper.get('title', 'Untitled')}**", expanded=False):
                     col_fb1, col_fb2 = st.columns([4, 1])
@@ -1113,7 +1151,7 @@ if relevant_papers or not_relevant_papers:
             for idx, item in enumerate(not_relevant_papers, 1):
                 paper = item["paper"]
                 note = item["note"]
-                paper_id = paper.get('id', hash(paper.get('title', '')))
+                paper_id = get_consistent_paper_id(paper)
                 
                 with st.expander(f"{idx}. **{paper.get('title', 'Untitled')}**", expanded=False):
                     col_fb1, col_fb2 = st.columns([4, 1])
